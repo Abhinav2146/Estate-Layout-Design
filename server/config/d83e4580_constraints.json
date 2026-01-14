@@ -1,0 +1,29 @@
+{
+  "project_id": "d83e4580",
+  "min_green_ratio": 0.1,
+  "setback_boundary_m": 5.0,
+  "buffer_obstacle_m": 3.0,
+  "main_road_width_m": 12.0,
+  "local_road_width_m": 8.0,
+  "allow_culdesac": true,
+  "parcel_program": [
+    {
+      "size_group": "Large",
+      "min_area": 6400.0,
+      "max_area": 8000.0,
+      "target_percent": 0.4
+    },
+    {
+      "size_group": "Medium",
+      "min_area": 3200.0,
+      "max_area": 4800.0,
+      "target_percent": 0.4
+    },
+    {
+      "size_group": "Small",
+      "min_area": 800.0,
+      "max_area": 1600.0,
+      "target_percent": 0.2
+    }
+  ]
+}
