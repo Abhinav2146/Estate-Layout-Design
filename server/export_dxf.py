@@ -50,6 +50,25 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
             elif geom.geom_type == 'MultiPolygon':
                 for poly in geom.geoms:
                     draw_solid_hatch(poly, layer_name)
+
+        def draw_lines(geom, layer_name, line_width=0.6):
+            if geom is None or geom.is_empty:
+                return
+
+            # Handle MultiLineString
+            if geom.geom_type == "MultiLineString":
+                for line in geom.geoms:
+                    draw_lines(line, layer_name, line_width)
+
+            elif geom.geom_type == "LineString":
+                pl = msp.add_lwpolyline(
+                    list(geom.coords),
+                    dxfattribs={"layer": layer_name}
+                )
+                pl.dxf.lineweight = int(line_width * 100)
+                if layer_name in COLOR_MAP:
+                    pl.dxf.true_color = ezdxf.colors.rgb2int(COLOR_MAP[layer_name])
+
         
         def draw_polygon_with_border(geom, fill_layer, border_color=(50, 50, 50), line_width=0.3):
             if geom is None or geom.is_empty: return
@@ -70,7 +89,8 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
             draw_solid_hatch(buildable_data["raw_geom"], "BOUNDARY")
 
         if "raw_geom" in road_data:
-            draw_solid_hatch(road_data["raw_geom"], "ROADS_MAIN")
+            draw_lines(road_data["raw_geom"], "ROADS_MAIN", line_width=0.8)
+
 
         for item in parcel_features:
             geom = item.get("geometry")

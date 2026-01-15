@@ -1,130 +1,153 @@
-from shapely.geometry import shape, LineString, Point
-from shapely.ops import unary_union
-import json
+import geopandas as gpd
 import os
-import math
+import json
+from shapely.ops import unary_union
+from shapely.geometry import GeometryCollection
 
-def generate_buildable_area(project_id: str, data_dir: str, config_dir: str):
-    # Load the Land GeoJSON
-    geojson_path = os.path.join(data_dir, f"{project_id}_map.geojson")
-    with open(geojson_path, "r") as f:
-        land_data = json.load(f)
 
-    # Load the Planning Constraints
-    config_path = os.path.join(config_dir, f"{project_id}_constraints.json")
-    with open(config_path, "r") as f:
-        constraints = json.load(f)
+# ------------------------------------------------------------
+# INTERNAL: Load GeoJSON
+# ------------------------------------------------------------
+def _load_geojson(project_id, data_dir):
+    path = os.path.join(data_dir, f"{project_id}_map.geojson")
+    if not os.path.exists(path):
+        raise FileNotFoundError("GeoJSON not found for project")
+    return gpd.read_file(path)
 
-    # Extract geometries from GeoJSON
-    boundary_geom = None
-    obstacle_geoms = []
 
-    for feature in land_data["features"]:
-        geom = shape(feature["geometry"])
-        if feature["properties"].get("type") == "boundary":
-            boundary_geom = geom
-        elif feature["properties"].get("type") == "obstacle":
-            obstacle_geoms.append(geom)
+def _load_constraints(project_id, config_dir):
+    path = os.path.join(config_dir, f"{project_id}_constraints.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
 
-    if not boundary_geom:
-        raise ValueError("Site boundary not found in GeoJSON")
-    
-    gross_area_sqm = boundary_geom.area
 
-    # Apply Setback Buffer (Negative buffer to shrink inward) 
-    setback_m = constraints.get("setback_boundary_m", 5.0)
-    buildable_area = boundary_geom.buffer(-setback_m)
+# ------------------------------------------------------------
+# BUILDABLE AREA
+# ------------------------------------------------------------
+def generate_buildable_area(project_id, data_dir, config_dir):
+    """
+    Buildable Area =
+      (boundary - boundary_setback)
+      - buffer(obstacle)
+      - buffer(DXF road)
+    """
 
-    # Apply Obstacle Buffers 
-    # Subtract obstacles + their required buffer from the buildable area
-    obstacle_buffer_m = constraints.get("buffer_obstacle_m", 3.0)
-    if obstacle_geoms:
-        # Combine all obstacles into one shape and buffer them
-        obstacles_union = unary_union([obs.buffer(obstacle_buffer_m) for obs in obstacle_geoms])
-        # Subtract from our buildable zone
-        buildable_area = buildable_area.difference(obstacles_union)
+    gdf = _load_geojson(project_id, data_dir)
+    constraints = _load_constraints(project_id, config_dir)
 
-    usable_area_sqm = buildable_area.area
+    boundary_setback = float(constraints.get("setback_boundary_m", 0))
+    obstacle_buffer = float(constraints.get("buffer_obstacle_m", 0))
 
-    return {
-        "feature": {
-            "type": "Feature",
-            "properties": {
-                "type": "buildable_area",
-                "label": "Buildable Footprint",
-                "style": {"fill": "#00ff00", "opacity": 0.3}
-            },
-            "geometry": buildable_area
-        },
-        "metrics": {
-            "gross_area_sqm": round(gross_area_sqm, 2),
-            "gross_area_rai": round(gross_area_sqm/1600, 2),
-            "usable_area_sqm": round(usable_area_sqm, 2),
-            "usable_area_rai": round(usable_area_sqm/1600, 2)
-        },
-        "raw_geom": buildable_area
+    boundary_gdf = gdf[gdf["type"] == "boundary"]
+    obstacle_gdf = gdf[gdf["type"] == "obstacle"]
+    road_gdf = gdf[gdf["type"] == "road"]
+
+    if boundary_gdf.empty:
+        raise ValueError("DXF must contain a boundary polygon")
+
+    # --------------------------------------------------
+    # Boundary setback (INWARD)
+    # --------------------------------------------------
+    site_geom = unary_union(boundary_gdf.geometry)
+    gross_area = site_geom.area
+
+    if boundary_setback > 0:
+        site_geom = site_geom.buffer(-boundary_setback)
+
+    subtract_geoms = []
+
+    # --------------------------------------------------
+    # Obstacle buffer
+    # --------------------------------------------------
+    if not obstacle_gdf.empty:
+        obs_geom = unary_union(obstacle_gdf.geometry)
+        if obstacle_buffer > 0:
+            obs_geom = obs_geom.buffer(obstacle_buffer)
+        subtract_geoms.append(obs_geom)
+
+    # --------------------------------------------------
+    # Road buffer (use same obstacle buffer unless specified)
+    # --------------------------------------------------
+    if not road_gdf.empty:
+        road_geom = unary_union(road_gdf.geometry)
+        road_geom = road_geom.buffer(obstacle_buffer)
+        subtract_geoms.append(road_geom)
+
+    # --------------------------------------------------
+    # Final buildable
+    # --------------------------------------------------
+    if subtract_geoms:
+        buildable_geom = site_geom.difference(unary_union(subtract_geoms))
+    else:
+        buildable_geom = site_geom
+
+    buildable_geom = buildable_geom.buffer(0)  # clean geometry
+    usable_area = buildable_geom.area
+
+    feature = {
+        "type": "Feature",
+        "geometry": buildable_geom.__geo_interface__,
+        "properties": {
+            "type": "buildable_area",
+            "boundary_setback_m": boundary_setback,
+            "obstacle_buffer_m": obstacle_buffer
+        }
     }
 
-def generate_main_road(project_id, data_dir, config_dir, buildable_area_geom):
-    # 1. Load Entry Points
-    geojson_path = os.path.join(data_dir, f"{project_id}_map.geojson")
-    with open(geojson_path, "r") as f:
-        land_data = json.load(f)
-    
-    entry_points = [shape(f["geometry"]) for f in land_data["features"] if f["properties"].get("type") == "entry_point"]
-    
-    if not entry_points:
-        raise ValueError("No entry points found.")
-
-    # 2. Load Constraints
-    config_path = os.path.join(config_dir, f"{project_id}_constraints.json")
-    with open(config_path, "r") as f:
-        constraints = json.load(f)
-    
-    road_width = constraints.get("main_road_width_m", 12.0)
-
-    # 3. Generate "Infinite" Spine Road
-    # We start at the entry, go to centroid, AND THEN KEEP GOING.
-    start_pt = entry_points[0].centroid
-    target_pt = buildable_area_geom.centroid
-    
-    # Vector Math: Calculate direction (dx, dy)
-    dx = target_pt.x - start_pt.x
-    dy = target_pt.y - start_pt.y
-    dist = math.sqrt(dx**2 + dy**2)
-    
-    if dist == 0:
-        extended_end = target_pt
-    else:
-        # Scale the vector to be long enough to cross the whole site (e.g., 3km)
-        scale_factor = 3000.0 / dist
-        new_x = start_pt.x + (dx * scale_factor)
-        new_y = start_pt.y + (dy * scale_factor)
-        extended_end = Point(new_x, new_y)
-
-    # Create the extended line
-    full_road_line = LineString([start_pt, extended_end])
-    
-    # Clip the road so it fits exactly inside the boundary
-    # We buffer the boundary slightly to ensure the road reaches the very edge
-    road_line_clipped = full_road_line.intersection(buildable_area_geom.buffer(10))
-
-    # Buffer to create width (Polygon)
-    road_polygon_raw = road_line_clipped.buffer(road_width / 2, cap_style=2)
-    
-    # Final clean clip to buildable area
-    road_polygon = road_polygon_raw.intersection(buildable_area_geom)
-    
+    # 🔒 RETURN TYPE MAINTAINED
     return {
-        "feature": {
-            "type": "Feature",
-            "properties": {
-                "type": "road", 
-                "label": "Main Access Road",
-                "style": {"fill": "#333333", "opacity": 1.0}
-            },
-            "geometry": road_polygon
+        "raw_geom": buildable_geom,
+        "metrics": { 
+            "gross_area_sqm": gross_area,
+            "usable_area_sqm": usable_area
         },
-        "raw_geom": road_polygon,
-        "width": road_width
+        "feature": feature
+    }
+
+
+# ------------------------------------------------------------
+# MAIN ROAD (DXF ONLY)
+# ------------------------------------------------------------
+def generate_main_road(project_id, data_dir, config_dir, site_geom):
+    """
+    Main road is read ONLY from DXF.
+    No procedural generation.
+    """
+
+    gdf = _load_geojson(project_id, data_dir)
+    road_gdf = gdf[gdf["type"] == "road"]
+
+    if road_gdf.empty:
+        empty = GeometryCollection()
+        return {
+            "raw_geom": empty,
+            "feature": {
+                "type": "Feature",
+                "geometry": empty.__geo_interface__,
+                "properties": {
+                    "type": "main_road",
+                    "source": "DXF",
+                    "status": "not_present"
+                }
+            }
+        }
+
+    road_geom = unary_union(road_gdf.geometry)
+
+    feature = {
+        "type": "Feature",
+        "geometry": road_geom.__geo_interface__,
+        "properties": {
+            "type": "main_road",
+            "source": "DXF",
+            "status": "locked"
+        }
+    }
+
+    # 🔒 RETURN TYPE MAINTAINED
+    return {
+        "raw_geom": road_geom,
+        "feature": feature
     }
