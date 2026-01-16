@@ -1,65 +1,11 @@
 from shapely.geometry import box, Polygon, MultiPolygon, LineString, Point, MultiLineString
 from shapely.ops import unary_union
+from shapely.affinity import rotate, translate
 import json
 import os
 import math
 import random
 
-# ------------------------------------------------------------
-# GEOMETRY HELPERS (Curved Roads & Smoothing)
-# ------------------------------------------------------------
-def chaikin_smooth(coords, iterations=3):
-    """
-    Applies Chaikin's corner cutting algorithm to smooth a polyline.
-    Used to turn jagged randomized paths into organic curves.
-    """
-    if len(coords) < 3:
-        return coords
-
-    for _ in range(iterations):
-        new_coords = [coords[0]]
-        for i in range(len(coords) - 1):
-            p0 = coords[i]
-            p1 = coords[i+1]
-            
-            # Create points at 25% and 75% along the segment
-            q = (0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1])
-            r = (0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1])
-            
-            new_coords.append(q)
-            new_coords.append(r)
-        
-        new_coords.append(coords[-1])
-        coords = new_coords
-        
-    return coords
-
-def create_curved_connection(p1, p2, bend_factor=0.2):
-    """
-    Creates a LineString between p1 and p2 with a randomized control point
-    to create a curved 'spline-like' geometry.
-    """
-    # Midpoint
-    mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-    
-    # Vector
-    vx, vy = p2[0] - p1[0], p2[1] - p1[1]
-    dist = math.sqrt(vx*vx + vy*vy)
-    
-    # Perpendicular offset (random direction)
-    offset = dist * bend_factor * random.uniform(-1, 1)
-    
-    # Normal vector (-vy, vx) normalized
-    if dist == 0: return LineString([p1, p2])
-    
-    nx, ny = -vy / dist, vx / dist
-    cx, cy = mx + nx * offset, my + ny * offset
-    
-    # Generate raw path [start, control, end] then smooth it
-    raw_coords = [p1, (cx, cy), p2]
-    smooth_coords = chaikin_smooth(raw_coords, iterations=4)
-    
-    return LineString(smooth_coords)
 
 # ------------------------------------------------------------
 # Parcel size sampler (RECTANGULAR, VARIABLE, MIN–MAX SAFE)
@@ -83,6 +29,43 @@ def choose_parcel_dimensions(min_area, max_area, aspect_ratio_range=(1.2, 2.8)):
 
     return width, depth
 
+# ------------------------------------------------------------
+# Helper: Get Highway Angle
+# ------------------------------------------------------------
+def get_dominant_angle(geometry):
+    """Calculates the orientation of the longest segment in the geometry."""
+    if geometry is None or geometry.is_empty:
+        return 0.0
+    
+    # Ensure we are looking at lines
+    if geometry.geom_type == 'Polygon' or geometry.geom_type == 'MultiPolygon':
+        geometry = geometry.boundary
+
+    lines = []
+    if geometry.geom_type == 'LineString':
+        lines = [geometry]
+    elif geometry.geom_type == 'MultiLineString':
+        lines = list(geometry.geoms)
+    else:
+        return 0.0
+
+    longest_len = 0
+    angle = 0
+
+    for line in lines:
+        coords = list(line.coords)
+        for i in range(len(coords) - 1):
+            p1 = coords[i]
+            p2 = coords[i+1]
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            length = math.sqrt(dx**2 + dy**2)
+            if length > longest_len:
+                longest_len = length
+                # Calculate angle in degrees
+                angle = math.degrees(math.atan2(dy, dx))
+    
+    return angle
 
 # ------------------------------------------------------------
 # MAIN FUNCTION
@@ -107,118 +90,110 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     if road_config:
         main_road_width = road_config.get("main_road_width", 18.0)
         local_road_width = road_config.get("local_road_width", 12.0)
-        # Interpret spacing as average density for organic generation
-        avg_spacing = road_config.get("vertical_spacing", 150) 
+        vertical_spacing = road_config.get("vertical_spacing", 250)
+        horizontal_spacing = road_config.get("horizontal_spacing", 180)
     else:
         main_road_width = constraints.get("main_road_width_m", 20.0)
         local_road_width = constraints.get("local_road_width_m", 10.0)
-        avg_spacing = 150
+        vertical_spacing = 250
+        horizontal_spacing = 180
 
     FRONTAGE_BUFFER = 25  # meters
     features = []
 
     # --------------------------------------------------------
-    # ORGANIC ROAD GENERATION (Curved + Roundabouts)
+    # Build road network (HIGHWAY ALIGNED & CURVED)
     # --------------------------------------------------------
     minx, miny, maxx, maxy = buildable_geom.bounds
+    center_x = (minx + maxx) / 2
+    center_y = (miny + maxy) / 2
     
-    # 1. Define Nodes (Perturbed Grid)
-    # We use a loose grid as a topological base but heavily perturb positions 
-    # to eliminate the "Manhattan" feel.
+    # 1. Determine Grid Orientation
+    # We rotate the grid to match the highway, rather than the axis
+    grid_rotation = get_dominant_angle(road_geom) if road_geom else 0
     
-    node_spacing = avg_spacing
-    cols = int((maxx - minx) / node_spacing) + 2
-    rows = int((maxy - miny) / node_spacing) + 2
+    # 2. Define Grid Extents (Diagonal to ensure coverage after rotation)
+    diag = math.sqrt((maxx - minx)**2 + (maxy - miny)**2)
+    extent = diag * 1.2
     
-    nodes = {} # Map (c, r) -> (x, y)
+    # 3. Generate Centerlines (in local un-rotated space)
+    lines_v = []
+    lines_h = []
+    junction_points = []
     
-    perturbation = node_spacing * 0.4 # allow 40% drift from grid center
-    
-    for r in range(rows):
-        for c in range(cols):
-            # Base grid position
-            bx = minx + c * node_spacing
-            by = miny + r * node_spacing
-            
-            # Randomized position
-            nx = bx + random.uniform(-perturbation, perturbation)
-            ny = by + random.uniform(-perturbation, perturbation)
-            nodes[(c, r)] = (nx, ny)
+    # Generate Vertical Spines
+    curr_x = -extent / 2
+    while curr_x < extent / 2:
+        l = LineString([(curr_x, -extent/2), (curr_x, extent/2)])
+        lines_v.append(l)
+        curr_x += vertical_spacing
 
-    # 2. Generate Connectivity (Edges)
-    # Connect nearest topological neighbors to ensure connectivity.
-    road_centerlines = []
-    junctions = []
+    # Generate Horizontal Ribs
+    curr_y = -extent / 2
+    while curr_y < extent / 2:
+        l = LineString([(-extent/2, curr_y), (extent/2, curr_y)])
+        lines_h.append(l)
+        curr_y += horizontal_spacing
 
-    for r in range(rows):
-        for c in range(cols):
-            curr_node = nodes[(c, r)]
-            
-            # Connect Horizontal (Right)
-            if c < cols - 1:
-                right_node = nodes[(c + 1, r)]
-                road_centerlines.append(create_curved_connection(curr_node, right_node))
-            
-            # Connect Vertical (Up)
-            if r < rows - 1:
-                up_node = nodes[(c, r + 1)]
-                road_centerlines.append(create_curved_connection(curr_node, up_node))
-                
-            # Track junctions for potential roundabouts
-            # We filter for nodes reasonably inside the buildable area
-            if buildable_geom.contains(Point(curr_node)):
-                junctions.append(curr_node)
+    # 4. Create Roundabout Nodes at Intersections
+    # We do this mathematically to avoid costly geometric intersections later
+    # Iterate through the grid coordinates we just generated
+    vx = -extent / 2
+    while vx < extent / 2:
+        vy = -extent / 2
+        while vy < extent / 2:
+            junction_points.append(Point(vx, vy))
+            vy += horizontal_spacing
+        vx += vertical_spacing
 
-    # 3. Create Road Surfaces (Buffering)
-    # Use shapely styling: cap_style=1 (Round), join_style=1 (Round)
-    generated_roads = []
+    # 5. Apply Rotation & Translation (Move grid to site)
+    # Combine all logic into lists for affine transformation
+    all_lines_v = MultiLineString(lines_v)
+    all_lines_h = MultiLineString(lines_h)
+    all_junctions = MultiPolygon([p.buffer(main_road_width * 0.8) for p in junction_points]) # Pre-buffer junctions as circles
+
+    # Rotate objects around (0,0) then translate to center of site
+    def transform_grid_geom(geom):
+        r_geom = rotate(geom, grid_rotation, origin=(0, 0))
+        t_geom = translate(r_geom, xoff=center_x, yoff=center_y)
+        return t_geom
+
+    final_lines_v = transform_grid_geom(all_lines_v)
+    final_lines_h = transform_grid_geom(all_lines_h)
+    final_roundabouts = transform_grid_geom(all_junctions)
+
+    # 6. Buffer and Buffer Style (The "Organic" Look)
+    # cap_style=1 (Round), join_style=1 (Round) replaces square boxes
+    # Vertical (Main) roads
+    poly_v = final_lines_v.buffer(main_road_width / 2, cap_style=1, join_style=1)
+    # Horizontal (Local) roads
+    poly_h = final_lines_h.buffer(local_road_width / 2, cap_style=1, join_style=1)
+
+    # 7. Merge & Clip
+    # Combine generated roads + roundabouts + existing highway
+    generated_network = unary_union([poly_v, poly_h, final_roundabouts])
     
-    for line in road_centerlines:
-        # Check if line is roughly relevant (intersects buildable)
-        if line.intersects(buildable_geom):
-            # Randomly assign width (Main vs Local)
-            # Bias towards Local, use Main for longer segments or random chance
-            width = main_road_width if random.random() < 0.2 else local_road_width
-            
-            poly = line.buffer(width / 2, cap_style=1, join_style=1)
-            generated_roads.append(poly)
-
-    # 4. Generate Roundabouts
-    # Place roundabouts at random valid junctions (approx 15% density)
-    roundabouts = []
-    roundabout_radius = main_road_width * 1.2
-    
-    for j_pt in junctions:
-        if random.random() < 0.15:
-            rb_poly = Point(j_pt).buffer(roundabout_radius)
-            roundabouts.append(rb_poly)
-
-    # 5. Merge & Clean Road Network
-    # Combine generated roads, roundabouts, and existing road_geom
-    
-    # Process existing road_geom (DXF import support)
-    existing_roads = []
-    if road_geom and not road_geom.is_empty:
+    # Merge with input highway (DXF) geometry
+    if road_geom:
+        # Buffer existing road if it's a line to ensure valid polygon union
         if road_geom.geom_type in ['LineString', 'MultiLineString']:
-            # If input is lines (DXF centerlines), buffer them
-            existing_roads.append(road_geom.buffer(main_road_width / 2, cap_style=1, join_style=1))
+            buffered_highway = road_geom.buffer(main_road_width / 2, cap_style=1, join_style=1)
+            full_network_raw = unary_union([generated_network, buffered_highway])
         else:
-            # If input is already polygons, keep as is
-            existing_roads.append(road_geom)
+            full_network_raw = unary_union([generated_network, road_geom])
+    else:
+        full_network_raw = generated_network
 
-    # Union all road layers
-    all_road_polys = generated_roads + roundabouts + existing_roads
-    raw_road_network = unary_union(all_road_polys)
-    
     # Clip to buildable area
-    full_road_network = raw_road_network.intersection(buildable_geom).buffer(0)
+    full_road_network = full_network_raw.intersection(buildable_geom).buffer(0)
+
     remaining_land = buildable_geom.difference(full_road_network).buffer(0)
 
     if remaining_land.is_empty:
         return []
 
     # --------------------------------------------------------
-    # Add road features (Metadata for Output)
+    # Add road features
     # --------------------------------------------------------
     road_geoms = (
         list(full_road_network.geoms)
@@ -227,22 +202,26 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     )
 
     for r in road_geoms:
-        if r.area < 10: 
+        if r.area < 50:
             continue
-            
-        # Simplified classification for organic roads
-        # Use simple area/perimeter heuristic or bounding box
-        min_r, min_c, max_r, max_c = r.bounds
-        extent = max((max_r - min_r), (max_c - min_c))
         
-        r_type = "main" if extent > avg_spacing * 1.5 else "local"
+        # Simplified classification based on width/area heuristic 
+        # since we don't have the original boxes to check intersection anymore
+        circle_factor = (4 * math.pi * r.area) / (r.length ** 2)
+        
+        if circle_factor > 0.6:
+            road_type = "junction" # Roundabout
+        elif r.area > (vertical_spacing * main_road_width * 0.5):
+            road_type = "main"
+        else:
+            road_type = "local"
 
         features.append({
             "type": "Feature",
             "geometry": r,
             "properties": {
                 "type": "road",
-                "road_type": r_type,
+                "road_type": road_type,
                 "area_sqm": round(r.area, 2)
             }
         })
@@ -303,11 +282,11 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
                         py += d * 0.7
                         continue
 
-                    # frontage constraint: must touch road buffer
-                    # Essential for organic layouts where roads aren't predictable
-                    if not plot.intersects(full_road_network.buffer(FRONTAGE_BUFFER)):
-                        py += d
-                        continue
+                    # frontage constraint for large plots
+                    if size_group == "Large":
+                        if not plot.intersects(full_road_network.buffer(FRONTAGE_BUFFER)):
+                            py += d
+                            continue
 
                     area = plot.area
                     if not (min_area <= area <= max_area):

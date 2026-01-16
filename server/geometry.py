@@ -37,8 +37,8 @@ def generate_buildable_area(project_id, data_dir, config_dir):
     gdf = _load_geojson(project_id, data_dir)
     constraints = _load_constraints(project_id, config_dir)
 
-    boundary_setback = float(constraints.get("setback_boundary_m", 0))
-    obstacle_buffer = float(constraints.get("buffer_obstacle_m", 0))
+    boundary_setback = float(constraints.get("setback_boundary_m", 5))
+    obstacle_buffer = float(constraints.get("buffer_obstacle_m", 3))
 
     boundary_gdf = gdf[gdf["type"] == "boundary"]
     obstacle_gdf = gdf[gdf["type"] == "obstacle"]

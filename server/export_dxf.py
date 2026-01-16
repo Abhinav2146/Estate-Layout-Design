@@ -88,10 +88,6 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
         if "raw_geom" in buildable_data:
             draw_solid_hatch(buildable_data["raw_geom"], "BOUNDARY")
 
-        if "raw_geom" in road_data:
-            draw_lines(road_data["raw_geom"], "ROADS_MAIN", line_width=0.8)
-
-
         for item in parcel_features:
             geom = item.get("geometry")
             props = item.get("properties", {})

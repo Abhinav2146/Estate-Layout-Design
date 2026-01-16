@@ -14,5 +14,4 @@ class PlanningConstraints(BaseModel):
     buffer_obstacle_m: float = 3.0
     main_road_width_m: float = 12.0
     local_road_width_m: float = 8.0
-    allow_culdesac: bool = True
     parcel_program: List[ParcelSizeTarget]
