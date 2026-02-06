@@ -13,6 +13,7 @@ from metrics import calculate_metrics
 from utils.utm_to_lat_long import to_lat_long
 from export_dxf import geometry_to_dxf
 from layout_variations import LayoutVariationGenerator
+from utils.helper import load_entry_points, load_elevation_points
 
 app = FastAPI(
     title="Industrial Estate Layout API",
@@ -41,7 +42,7 @@ async def upload_land(file: UploadFile = File(...)):
 
     # Create a unique project workspace
     project_id = str(uuid.uuid4())[:8]
-    file_path = os.path.join(DATA_DIR, f"{project_id}_{file.filename}")
+    file_path = os.path.join(DATA_DIR, f"{project_id}.dxf")
 
     # Save the uploaded file
     try:
@@ -64,12 +65,7 @@ async def upload_land(file: UploadFile = File(...)):
 
     return {
         "project_id": project_id,
-        "success": land_data["geometry_valid"],
-        "total_site_area_sqm": land_data["area_sqm"],
-        "total_site_area_rai": land_data["area_rai"],
-        "entry_points_found": land_data["entry_point_count"],
-        "obstacles_found": land_data["obstacle_count"],
-        "existing_road_segments": land_data.get("road_segment_count", 0),
+        **land_data,
         "map_data_url": f"/data/{output_geojson_name}"
     }
 
@@ -93,12 +89,16 @@ async def get_layout_preview(project_id: str):
     try:
         buildable = generate_buildable_area(project_id, DATA_DIR, CONFIG_DIR)
         road = generate_main_road(project_id, DATA_DIR, CONFIG_DIR, buildable["raw_geom"])
+        entry_points = load_entry_points(project_id)
+        elevation_points = load_elevation_points(project_id, DATA_DIR)
         parcels = generate_parcels(
             project_id, 
             DATA_DIR, 
             CONFIG_DIR, 
             buildable["raw_geom"], 
             road["raw_geom"],
+            entry_points,
+            elevation_points=elevation_points
         )
         final_metrics = calculate_metrics(buildable, road, parcels)
 
@@ -119,18 +119,16 @@ async def get_layout_preview(project_id: str):
 @app.get("/projects/{project_id}/export/dxf")
 async def export_dxf_layout(project_id: str):
     try:
-        # Re-run logic to get raw objects
         buildable = generate_buildable_area(project_id, DATA_DIR, CONFIG_DIR)
         road = generate_main_road(project_id, DATA_DIR, CONFIG_DIR, buildable["raw_geom"])
-        parcels_raw = generate_parcels(
-            project_id, DATA_DIR, CONFIG_DIR, buildable["raw_geom"], road["raw_geom"]
+        entry_points = load_entry_points(project_id)
+        elevation_points = load_elevation_points(project_id, DATA_DIR)
+        parcels = generate_parcels(
+            project_id, DATA_DIR, CONFIG_DIR, buildable["raw_geom"], road["raw_geom"], entry_points, elevation_points=elevation_points
         )
-        metrics_input = [{"properties": p["properties"]} for p in parcels_raw]
-        final_metrics = calculate_metrics(buildable, road, metrics_input)
-        # Now we pass RAW objects directly to DXF writer
-        # We don't need _raw_geom hacks anymore because 'parcels_raw' IS raw geometry
+        final_metrics = calculate_metrics(buildable, road, parcels)
         dxf_filename = geometry_to_dxf(
-            project_id, DATA_DIR, buildable, road, parcels_raw, metrics=final_metrics
+            project_id, DATA_DIR, buildable, road, parcels, metrics=final_metrics
         )
         
         return FileResponse(os.path.join(DATA_DIR, dxf_filename), filename=dxf_filename)
@@ -153,36 +151,31 @@ async def export_layout_variations(project_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/projects/{project_id}/variations/preview")
-async def preview_layout_variations(project_id: str):
-    try:
-        generator = LayoutVariationGenerator(project_id, DATA_DIR, CONFIG_DIR)
-        variations = generator.generate_all_variations()
+# @app.get("/projects/{project_id}/variations/preview")
+# async def preview_layout_variations(project_id: str):
+#     try:
+#         generator = LayoutVariationGenerator(project_id, DATA_DIR, CONFIG_DIR)
+#         variations = generator.generate_all_variations()
         
-        preview_data = []
-        for var in variations:
-            if var["status"] == "success":
-                preview_data.append({
-                    "name": var["name"],
-                    "description": var["description"],
-                    "optimization_type": var["optimization_type"],
-                    "parcel_mix": var["parcel_mix"],
-                    "config": var["config"],
-                    "kpi": var["kpi"],
-                    "metrics": var["metrics"],
-                    "net_buildable":var["net_buildable"]
-                })
-            else:
-                preview_data.append({
-                    "name": var["name"],
-                    "description": var["description"],
-                    "status": "error",
-                    "error": var.get("error", "Unknown error")
-                })
+#         preview_data = []
+#         for var in variations:
+#             if var["status"] == "success":
+#                 preview_data.append({
+#                     "name": var["name"],
+#                     "kpi": var["kpi"],
+#                     "metrics": var["metrics"],
+#                     "net_buildable":var["net_buildable"]
+#                 })
+#             else:
+#                 preview_data.append({
+#                     "name": var["name"],
+#                     "status": "error",
+#                     "error": var.get("error", "Unknown error")
+#                 })
         
-        return {
-            "project_id": project_id,
-            "variations": preview_data,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#         return {
+#             "project_id": project_id,
+#             "variations": preview_data,
+#         }
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))

@@ -1,17 +1,25 @@
 import ezdxf
 import os
 import traceback
+import json
 from ezdxf.enums import TextEntityAlignment
 
 # RGB Color Mapping for AutoCAD - UPDATED FOR HIGH CONTRAST
 COLOR_MAP = {
     "BOUNDARY": (220, 220, 220),    # Light Gray
+    "GREEN_BELT": (100, 150, 100),  # <--- ADDED: Darker Green for Setback Ring
     "ROADS_MAIN": (255,0,0),        # Red - Main Roads
     "ROADS_LOCAL": (255,0,255),     # Magenta (Purple) - Local Roads
     "PARCEL_S": (255, 200, 200),    
     "PARCEL_M": (200, 220, 255),    
     "PARCEL_L": (255, 255, 200),    
-    "GREEN_AREA": (150, 200, 150),  
+    "GREEN_AREA": (150, 200, 150),
+    
+    # --- NEW LAYERS FOR UTILITIES (MVP2) ---
+    "UTILITY_POND": (0, 100, 255),  # Blue (Retention Pond)
+    "UTILITY_WTP": (0, 255, 255),   # Cyan (Water Treatment Plant)
+    # ---------------------------------------
+
     "PARCEL_BORDER": (50, 50, 50),  
     "TEXT_LABELS": (0, 0, 0),       
     "TABLE_LINES": (100, 100, 100), 
@@ -20,6 +28,11 @@ COLOR_MAP = {
 
 def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_features, metrics=None, filename=None):
     try:
+        # source_dxf = os.path.join(data_dir, f"{project_id}.dxf")
+        # if not os.path.exists(source_dxf):
+        #     raise FileNotFoundError("Source DXF not found for export")
+
+        # doc = ezdxf.readfile(source_dxf)
         doc = ezdxf.new("R2010") 
         msp = doc.modelspace()
 
@@ -61,11 +74,7 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 
                 # 2. Draw Border
                 # CRITICAL FIX: For Roads, the border MUST match the fill layer
-                # This ensures that if hatch fails, we still see a PURPLE line, not a gray one.
                 target_border_layer = fill_layer if "ROADS" in fill_layer else 'PARCEL_BORDER'
-                
-                # If it's a road, we override the border color to match the road color (or keep it dark for contrast if preferred)
-                # But to solve "missing color", we force the layer to be the road layer so it inherits properties
                 
                 exterior_coords = list(geom.exterior.coords)
                 polyline = msp.add_lwpolyline(exterior_coords, dxfattribs={'layer': target_border_layer, 'closed': True})
@@ -84,6 +93,12 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                     draw_polygon_with_border(poly, fill_layer, border_color, line_width)
 
         # Draw Geometry
+        
+        # 1. ADDED: Draw Green Belt Ring first
+        if "green_belt_geom" in buildable_data:
+            draw_solid_hatch(buildable_data["green_belt_geom"], "GREEN_BELT")
+
+        # 2. Draw Buildable Area (Inner Site)
         if "raw_geom" in buildable_data:
             draw_solid_hatch(buildable_data["raw_geom"], "BOUNDARY")
 
@@ -115,9 +130,20 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 draw_polygon_with_border(geom, layer, line_width=l_width)
 
             elif f_type == "green":
-                draw_polygon_with_border(geom, "GREEN_AREA", border_color=(50, 100, 50), line_width=0.5)
+                # --- NEW LOGIC: Check Utility Type (MVP2) ---
+                label = props.get("label", "")
+                utility = props.get("utility_type", "")
+                
+                if "WTP" in label or "Water Treatment" in utility:
+                    target_layer = "UTILITY_WTP"
+                elif "Pond" in label or "Retention" in utility:
+                    target_layer = "UTILITY_POND"
+                else:
+                    target_layer = "GREEN_AREA"
+                
+                draw_polygon_with_border(geom, target_layer, border_color=(50, 100, 50), line_width=0.5)
 
-        # DRAW SUMMARY TABLE
+        # DRAW TABLES (SUMMARY & CONSTRAINTS)
         if metrics and "raw_geom" in buildable_data:
             try:
                 site_bounds = buildable_data["raw_geom"].bounds
@@ -157,6 +183,14 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 cur_y -= 72
                 draw_row("Total Site", f"{site.get('total_site_sqm',0):,} sqm", cur_y)
                 cur_y -= 54
+                
+                # --- ADDED: Green Belt Area Row ---
+                # This ensures the client sees the subtracted area
+                green_sqm = site.get('green_belt_sqm', 0)
+                draw_row("Green Belt Area", f"{green_sqm:,} sqm", cur_y)
+                cur_y -= 54
+                # ----------------------------------
+
                 draw_row("Net Buildable", f"{site.get('total_usable_sqm',0):,} sqm", cur_y)
                 cur_y -= 54
                 sa = land.get('saleable_area', {})
@@ -166,17 +200,84 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 draw_row("Road Area", f"{ra.get('sqm',0):,} sqm ({ra.get('percent',0)}%)", cur_y)
                 cur_y -= 54
                 ga = land.get('green_area', {})
-                draw_row("Green Area", f"{ga.get('sqm',0):,} sqm ({ga.get('percent',0)}%)", cur_y)
+                draw_row("Internal Green", f"{ga.get('sqm',0):,} sqm ({ga.get('percent',0)}%)", cur_y)
                 cur_y -= 54
                 draw_row("TOTAL PLOTS", str(inv.get('total_plots',0)), cur_y, True)
                 cur_y -= 72
                 for k, v in breakdown.items():
                     draw_row(f"{k} Plots", str(v), cur_y)
                     cur_y -= 54
+                
+                # Bottom line of Summary Table
                 msp.add_line((x_start, cur_y + 54), (x_start + 990, cur_y + 54), dxfattribs={'layer': 'TABLE_LINES'})
+                
+                # --- NEW CONSTRAINTS TABLE ---
+                # Attempt to load constraints file
+                CONFIG_DIR = "config"
+                constraints_path = os.path.join(CONFIG_DIR, f"{project_id}_constraints.json")
+                constraints = None
+                if os.path.exists(constraints_path):
+                    with open(constraints_path, "r") as f:
+                        constraints = json.load(f)
+                
+                if constraints:
+                    cur_y -= 100 # Gap between tables
+                    
+                    draw_row("DESIGN CONSTRAINTS", "", cur_y, True)
+                    cur_y -= 72
+                    
+                    # --- ADDED: MVP2 Parameters ---
+                    ind_type = constraints.get('industry_type', 'Light Industry')
+                    draw_row("Industry Type", ind_type, cur_y)
+                    cur_y -= 54
+                    
+                    gb_setback = constraints.get('green_belt_setback_m', 10.0)
+                    draw_row("Green Belt Setback", f"{gb_setback} m", cur_y)
+                    cur_y -= 54
+                    
+                    pond_tgt = constraints.get('retention_pond_target_percent', 0.07) * 100
+                    draw_row("Target: Retention Pond", f"{pond_tgt:.1f}%", cur_y)
+                    cur_y -= 54
+                    
+                    wtp_tgt = constraints.get('wtp_target_percent', 0.02) * 100
+                    draw_row("Target: WTP", f"{wtp_tgt:.1f}%", cur_y)
+                    cur_y -= 54
+                    # ------------------------------
+
+                    # Global Settings (Existing)
+                    draw_row("Min Green Ratio", f"{constraints.get('min_green_ratio', 0.0)*100}%", cur_y)
+                    cur_y -= 54
+                    draw_row("Main Road Width", f"{constraints.get('main_road_width_m', 0)} m", cur_y)
+                    cur_y -= 54
+                    draw_row("Local Road Width", f"{constraints.get('local_road_width_m', 0)} m", cur_y)
+                    cur_y -= 54
+                    if "setback_boundary_m" in constraints:
+                        draw_row("Boundary Setback", f"{constraints.get('setback_boundary_m')} m", cur_y)
+                        cur_y -= 54
+                    if "buffer_obstacle_m" in constraints:
+                        draw_row("Obstacle Buffer", f"{constraints.get('buffer_obstacle_m')} m", cur_y)
+                        cur_y -= 54
+
+                    # Parcel Program
+                    draw_row("PARCEL PROGRAM", "", cur_y, True)
+                    cur_y -= 72
+                    
+                    for p in constraints.get("parcel_program", []):
+                        name = p.get("size_group", "Generic")
+                        target = p.get("target_percent", 0) * 100
+                        min_a = p.get("min_area", 0)
+                        max_a = p.get("max_area", 0)
+                        
+                        label_str = f"{name} ({min_a:.0f}-{max_a:.0f} sqm)"
+                        val_str = f"Target: {target:.0f}%"
+                        draw_row(label_str, val_str, cur_y)
+                        cur_y -= 54
+                        
+                    # Bottom line of Constraints Table
+                    msp.add_line((x_start, cur_y + 54), (x_start + 990, cur_y + 54), dxfattribs={'layer': 'TABLE_LINES'})
 
             except Exception as e:
-                print(f"Warning: Could not draw summary table: {e}")
+                print(f"Warning: Could not draw summary/constraints table: {e}")
                 traceback.print_exc()
 
         if filename is None:

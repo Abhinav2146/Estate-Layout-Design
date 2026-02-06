@@ -45,6 +45,7 @@ def calculate_metrics(buildable_data, road_data, parcel_features):
     # Calculate Totals
     total_site_sqm = buildable_data["metrics"].get("gross_area_sqm", 0)
     total_usable_sqm = buildable_data["metrics"]["usable_area_sqm"]
+    green_belt_sqm = buildable_data["metrics"].get("green_belt_area_sqm", 0)
     
     # Avoid division by zero
     if total_usable_sqm > 0:
@@ -58,6 +59,7 @@ def calculate_metrics(buildable_data, road_data, parcel_features):
     return {
         "site_analysis": {
             "total_site_sqm": round(total_site_sqm,2),
+            "green_belt_sqm": round(green_belt_sqm, 2),
             "total_site_rai": round(total_site_sqm/1600,2),
             "total_usable_sqm": round(total_usable_sqm, 2),
             "total_usable_rai": round(total_usable_sqm / 1600, 2),
