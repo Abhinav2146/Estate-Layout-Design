@@ -7,24 +7,29 @@ from ezdxf.enums import TextEntityAlignment
 # RGB Color Mapping for AutoCAD - UPDATED FOR HIGH CONTRAST
 COLOR_MAP = {
     "BOUNDARY": (220, 220, 220),    # Light Gray
-    "GREEN_BELT": (100, 150, 100),  # <--- ADDED: Darker Green for Setback Ring
-    "ROADS_MAIN": (255,0,0),        # Red - Main Roads
-    "ROADS_LOCAL": (255,0,255),     # Magenta (Purple) - Local Roads
+    "GREEN_BELT": (100, 150, 100),  # Darker Green for Setback Ring
+    "ROADS_MAIN": (255, 0, 0),      # Red - Main Roads
+    "ROADS_LOCAL": (255, 0, 255),   # Magenta (Purple) - Local Roads
     "PARCEL_S": (255, 200, 200),    
     "PARCEL_M": (200, 220, 255),    
     "PARCEL_L": (255, 255, 200),    
     "GREEN_AREA": (150, 200, 150),
     
-    # --- NEW LAYERS FOR UTILITIES (MVP2) ---
+    # --- UTILITIES ---
     "UTILITY_POND": (0, 100, 255),  # Blue (Retention Pond)
     "UTILITY_WTP": (0, 255, 255),   # Cyan (Water Treatment Plant)
-    # ---------------------------------------
 
     "PARCEL_BORDER": (50, 50, 50),  
     "TEXT_LABELS": (0, 0, 0),       
     "TABLE_LINES": (100, 100, 100), 
     "TABLE_TEXT": (0, 0, 0)         
 }
+
+# --- CONFIGURABLE FONT SIZES ---
+TEXT_H_PARCEL = 12.0   # Increased from 2.5
+TEXT_H_UTILITY = 12.0  # Increased from 3.5
+TEXT_H_TABLE_HEAD = 24.0
+TEXT_H_TABLE_BODY = 18
 
 def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_features, metrics=None, filename=None):
     try:
@@ -36,6 +41,7 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
         doc = ezdxf.new("R2010") 
         msp = doc.modelspace()
 
+        # Create Layers
         for layer_name in COLOR_MAP.keys():
             if layer_name not in doc.layers:
                 doc.layers.new(name=layer_name)
@@ -44,7 +50,7 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
         def draw_solid_hatch(geom, layer_name):
             if geom is None or geom.is_empty: return
             
-            # FIX: Simplify slightly to prevent hatch failure on micro-segments
+            # Simplify slightly to prevent hatch failure
             clean_geom = geom.simplify(0.01, preserve_topology=True)
 
             if clean_geom.geom_type == 'Polygon':
@@ -59,7 +65,6 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                     for interior in clean_geom.interiors:
                         hatch.paths.add_polyline_path([(p[0], p[1]) for p in interior.coords], is_closed=True)
                 except Exception as e:
-                    # Fallback: If hatch fails, rely on the border (drawn separately)
                     print(f"Hatch Error for {layer_name}: {e}")
 
             elif clean_geom.geom_type == 'MultiPolygon':
@@ -73,14 +78,12 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 draw_solid_hatch(geom, fill_layer)
                 
                 # 2. Draw Border
-                # CRITICAL FIX: For Roads, the border MUST match the fill layer
                 target_border_layer = fill_layer if "ROADS" in fill_layer else 'PARCEL_BORDER'
                 
                 exterior_coords = list(geom.exterior.coords)
                 polyline = msp.add_lwpolyline(exterior_coords, dxfattribs={'layer': target_border_layer, 'closed': True})
                 
                 if "ROADS" in fill_layer:
-                    # Use the specific layer color for the outline too
                     if fill_layer in COLOR_MAP:
                          polyline.dxf.true_color = ezdxf.colors.rgb2int(COLOR_MAP[fill_layer])
                 else:
@@ -92,13 +95,13 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 for poly in geom.geoms:
                     draw_polygon_with_border(poly, fill_layer, border_color, line_width)
 
-        # Draw Geometry
+        # --- DRAW GEOMETRY ---
         
-        # 1. ADDED: Draw Green Belt Ring first
+        # 1. Green Belt
         if "green_belt_geom" in buildable_data:
             draw_solid_hatch(buildable_data["green_belt_geom"], "GREEN_BELT")
 
-        # 2. Draw Buildable Area (Inner Site)
+        # 2. Site Boundary
         if "raw_geom" in buildable_data:
             draw_solid_hatch(buildable_data["raw_geom"], "BOUNDARY")
 
@@ -108,32 +111,36 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
             if not geom: continue
             
             f_type = props.get("type")
+            
+            # --- PARCELS ---
             if f_type == "parcel":
                 size = props.get("size_group", "Medium")
                 if "Small" in size: layer = "PARCEL_S"
                 elif "Large" in size: layer = "PARCEL_L"
                 else: layer = "PARCEL_M"
+                
                 draw_polygon_with_border(geom, layer, border_color=(50, 50, 50), line_width=0.5)
                 
+                # Label Parcel (INCREASED FONT SIZE)
                 label_txt = props.get("label")
                 if label_txt:
                     center = geom.centroid
-                    msp.add_text(str(label_txt), dxfattribs={'layer': 'TEXT_LABELS', 'height': 2.5})\
+                    msp.add_text(str(label_txt), dxfattribs={'layer': 'TEXT_LABELS', 'height': TEXT_H_PARCEL})\
                        .set_placement((center.x, center.y), align=TextEntityAlignment.MIDDLE_CENTER)
 
+            # --- ROADS ---
             elif f_type == "road":
                 road_type = props.get("road_type", "local")
                 layer = "ROADS_MAIN" if road_type == "main" else "ROADS_LOCAL"
-                
-                # For roads, use thicker lines
                 l_width = 0.5 if road_type == "main" else 0.4
                 draw_polygon_with_border(geom, layer, line_width=l_width)
 
+            # --- UTILITIES & GREEN AREAS ---
             elif f_type == "green":
-                # --- NEW LOGIC: Check Utility Type (MVP2) ---
                 label = props.get("label", "")
                 utility = props.get("utility_type", "")
                 
+                # Determine Layer
                 if "WTP" in label or "Water Treatment" in utility:
                     target_layer = "UTILITY_WTP"
                 elif "Pond" in label or "Retention" in utility:
@@ -143,7 +150,26 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 
                 draw_polygon_with_border(geom, target_layer, border_color=(50, 100, 50), line_width=0.5)
 
-        # DRAW TABLES (SUMMARY & CONSTRAINTS)
+                # --- LABELING LOGIC ---
+                # Only label WTP or POND. Skip generic GREEN_AREA.
+                if target_layer in ["UTILITY_WTP", "UTILITY_POND"]:
+                    
+                    display_label = label if label else utility
+                    
+                    # Hardcode fallback if name is missing but type is known
+                    if target_layer == "UTILITY_WTP" and not display_label:
+                        display_label = "WTP"
+                    elif target_layer == "UTILITY_POND" and not display_label:
+                        display_label = "Pond"
+
+                    if display_label:
+                        center = geom.centroid
+                        # Use LARGER FONT for Utilities
+                        msp.add_text(str(display_label), dxfattribs={'layer': 'TEXT_LABELS', 'height': TEXT_H_UTILITY})\
+                           .set_placement((center.x, center.y), align=TextEntityAlignment.MIDDLE_CENTER)
+
+
+        # --- DRAW TABLES ---
         if metrics and "raw_geom" in buildable_data:
             try:
                 site_bounds = buildable_data["raw_geom"].bounds
@@ -152,7 +178,7 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 y_start = maxy
                 
                 def draw_row(label, value, y, is_header=False):
-                    h = 24.0 if is_header else 16.5
+                    h = TEXT_H_TABLE_HEAD if is_header else TEXT_H_TABLE_BODY
                     col_width_label = 450
                     col_width_val = 540
                     total_width = col_width_label + col_width_val
@@ -184,12 +210,9 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 draw_row("Total Site", f"{site.get('total_site_sqm',0):,} sqm", cur_y)
                 cur_y -= 54
                 
-                # --- ADDED: Green Belt Area Row ---
-                # This ensures the client sees the subtracted area
                 green_sqm = site.get('green_belt_sqm', 0)
                 draw_row("Green Belt Area", f"{green_sqm:,} sqm", cur_y)
                 cur_y -= 54
-                # ----------------------------------
 
                 draw_row("Net Buildable", f"{site.get('total_usable_sqm',0):,} sqm", cur_y)
                 cur_y -= 54
@@ -208,11 +231,9 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                     draw_row(f"{k} Plots", str(v), cur_y)
                     cur_y -= 54
                 
-                # Bottom line of Summary Table
                 msp.add_line((x_start, cur_y + 54), (x_start + 990, cur_y + 54), dxfattribs={'layer': 'TABLE_LINES'})
                 
-                # --- NEW CONSTRAINTS TABLE ---
-                # Attempt to load constraints file
+                # --- DESIGN CONSTRAINTS TABLE ---
                 CONFIG_DIR = "config"
                 constraints_path = os.path.join(CONFIG_DIR, f"{project_id}_constraints.json")
                 constraints = None
@@ -221,30 +242,23 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                         constraints = json.load(f)
                 
                 if constraints:
-                    cur_y -= 100 # Gap between tables
-                    
+                    cur_y -= 100 
                     draw_row("DESIGN CONSTRAINTS", "", cur_y, True)
                     cur_y -= 72
                     
-                    # --- ADDED: MVP2 Parameters ---
                     ind_type = constraints.get('industry_type', 'Light Industry')
                     draw_row("Industry Type", ind_type, cur_y)
                     cur_y -= 54
-                    
                     gb_setback = constraints.get('green_belt_setback_m', 10.0)
                     draw_row("Green Belt Setback", f"{gb_setback} m", cur_y)
                     cur_y -= 54
-                    
                     pond_tgt = constraints.get('retention_pond_target_percent', 0.07) * 100
                     draw_row("Target: Retention Pond", f"{pond_tgt:.1f}%", cur_y)
                     cur_y -= 54
-                    
                     wtp_tgt = constraints.get('wtp_target_percent', 0.02) * 100
                     draw_row("Target: WTP", f"{wtp_tgt:.1f}%", cur_y)
                     cur_y -= 54
-                    # ------------------------------
 
-                    # Global Settings (Existing)
                     draw_row("Min Green Ratio", f"{constraints.get('min_green_ratio', 0.0)*100}%", cur_y)
                     cur_y -= 54
                     draw_row("Main Road Width", f"{constraints.get('main_road_width_m', 0)} m", cur_y)
@@ -258,7 +272,6 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                         draw_row("Obstacle Buffer", f"{constraints.get('buffer_obstacle_m')} m", cur_y)
                         cur_y -= 54
 
-                    # Parcel Program
                     draw_row("PARCEL PROGRAM", "", cur_y, True)
                     cur_y -= 72
                     
@@ -273,7 +286,6 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                         draw_row(label_str, val_str, cur_y)
                         cur_y -= 54
                         
-                    # Bottom line of Constraints Table
                     msp.add_line((x_start, cur_y + 54), (x_start + 990, cur_y + 54), dxfattribs={'layer': 'TABLE_LINES'})
 
             except Exception as e:

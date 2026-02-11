@@ -1,6 +1,6 @@
 import os
 import json
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon, MultiPolygon
 import geopandas as gpd
 import math
 from shapely.strtree import STRtree
@@ -134,3 +134,72 @@ def get_elevation_stats(geom, tree, z_values):
     max_z = max(elevs)
     variance = max_z - min_z # Simple delta approximation for slope
     return min_z, max_z, variance
+
+def create_entry_splay(line_geom, entry_pt, width):
+        """Creates a 45-degree chamfer/splay at the end of the line closest to entry_pt."""
+        if line_geom is None or line_geom.is_empty: return Polygon()
+        
+        # --- FIX START: Handle MultiLineString ---
+        actual_line = line_geom
+        if line_geom.geom_type == 'MultiLineString':
+            # Pick the line segment that is actually closest to the entry point
+            # (The intersection might have split the road into multiple parts)
+            if not line_geom.geoms: return Polygon()
+            actual_line = min(line_geom.geoms, key=lambda g: g.distance(entry_pt))
+        elif line_geom.geom_type == 'GeometryCollection':
+             # Try to find a LineString in the collection
+             lines = [g for g in line_geom.geoms if g.geom_type == 'LineString']
+             if lines:
+                 actual_line = min(lines, key=lambda g: g.distance(entry_pt))
+             else:
+                 return Polygon()
+        # --- FIX END ---
+        
+        if actual_line.geom_type != 'LineString': return Polygon()
+        
+        # Determine which end is the start (closest to entry point)
+        coords = list(actual_line.coords)
+        if len(coords) < 2: return Polygon()
+
+        p_start, p_end = coords[0], coords[-1]
+        dist_start = Point(p_start).distance(entry_pt)
+        dist_end = Point(p_end).distance(entry_pt)
+        
+        if dist_start < dist_end:
+            p1, p2 = coords[0], coords[1]
+        else:
+            p1, p2 = coords[-1], coords[-2]
+            
+        # Vector P1 -> P2 (Road direction into the site)
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        length = math.sqrt(dx*dx + dy*dy)
+        if length == 0: return Polygon()
+        ux, uy = dx/length, dy/length
+        
+        # Right vector (Perpendicular)
+        rx, ry = -uy, ux
+        
+        # Splay size (Leg length of the 45 deg triangle)
+        splay_len = width 
+        
+        # Calculate Base Corners at P1 (The standard road corners)
+        # Left Corner
+        lc_x = p1[0] - (width/2)*rx
+        lc_y = p1[1] - (width/2)*ry
+        
+        # Right Corner
+        rc_x = p1[0] + (width/2)*rx
+        rc_y = p1[1] + (width/2)*ry
+        
+        # Generate 45-degree Triangles
+        # Left Triangle: From Left Corner, go Out (Left) and Forward (Up road)
+        lt_p2 = (lc_x - splay_len*rx, lc_y - splay_len*ry) # Out
+        lt_p3 = (lc_x + splay_len*ux, lc_y + splay_len*uy) # Forward
+        left_tri = Polygon([(lc_x, lc_y), lt_p2, lt_p3])
+        
+        # Right Triangle: From Right Corner, go Out (Right) and Forward (Up road)
+        rt_p2 = (rc_x + splay_len*rx, rc_y + splay_len*ry) # Out
+        rt_p3 = (rc_x + splay_len*ux, rc_y + splay_len*uy) # Forward
+        right_tri = Polygon([(rc_x, rc_y), rt_p2, rt_p3])
+        
+        return MultiPolygon([left_tri, right_tri])

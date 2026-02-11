@@ -1,11 +1,12 @@
 from shapely.geometry import box, Polygon, MultiPolygon, LineString, Point
-from shapely.ops import unary_union
+from shapely.ops import unary_union, linemerge
 from shapely.affinity import rotate, translate
 from shapely.prepared import prep
 import json
 import os
 import math
-from utils.helper import get_dominant_angle, get_elevation_stats, build_elevation_index, parcel_elevation
+import geopandas as gpd
+from utils.helper import get_dominant_angle, get_elevation_stats, build_elevation_index, parcel_elevation, create_entry_splay
 
 def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom, entry_points, elevation_points, road_config=None):
 
@@ -17,6 +18,12 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     # --- 1. CONFIG & ROADS ---
     config_path = os.path.join(config_dir, f"{project_id}_constraints.json")
     with open(config_path, "r") as f: constraints = json.load(f)
+
+    map_path = os.path.join(data_dir, f"{project_id}_map.geojson")
+    map_gdf = gpd.read_file(map_path)
+    # Get the raw boundary polygon
+    site_boundary_full = unary_union(map_gdf[map_gdf["type"] == "boundary"].geometry)
+    # -------------------------
     
     parcel_program = constraints.get("parcel_program", [])
     min_green_ratio = constraints.get("min_green_ratio", 0.1) 
@@ -36,13 +43,13 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     if road_config:
         main_road_width = road_config.get("main_road_width", 12.0)
         local_road_width = road_config.get("local_road_width", 8.0)
-        vertical_spacing = road_config.get("vertical_spacing", (est_depth * 2) + local_road_width)
-        horizontal_spacing = road_config.get("horizontal_spacing", (est_depth * 500) + main_road_width)
+        vertical_spacing = road_config.get("vertical_spacing", (est_depth * 2))
+        horizontal_spacing = road_config.get("horizontal_spacing", (est_depth * 500))
     else:
         main_road_width = constraints.get("main_road_width_m", 12.0)
         local_road_width = constraints.get("local_road_width_m", 8.0)
-        vertical_spacing = (est_depth * 2) + local_road_width
-        horizontal_spacing = (est_depth * 500) + main_road_width
+        vertical_spacing = (est_depth * 2)
+        horizontal_spacing = (est_depth * 500)
 
     features = []
 
@@ -113,8 +120,8 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
             max_len = -1
             
             for angle_rad in candidate_angles:
-                dx = math.cos(angle_rad) * extent
-                dy = math.sin(angle_rad) * extent
+                dx = math.cos(angle_rad) * (extent * 1.5) 
+                dy = math.sin(angle_rad) * (extent * 1.5)
                 line = LineString([(ep_x - dx, ep_y - dy), (ep_x + dx, ep_y + dy)])
                 
                 clipped = line.intersection(effective_buildable)
@@ -128,28 +135,41 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
                 selected_lines.append({"origin": entry_pt, "line": best_line})
 
         if len(selected_lines) == 2:
-            l1, l2 = selected_lines[0], selected_lines[1]
-            intersection = l1["line"].intersection(l2["line"])
-            if not intersection.is_empty and intersection.geom_type == 'Point':
-                seg1 = LineString([(l1["origin"].x, l1["origin"].y), (intersection.x, intersection.y)]).intersection(effective_buildable)
-                seg2 = LineString([(l2["origin"].x, l2["origin"].y), (intersection.x, intersection.y)]).intersection(effective_buildable)
-                if not seg1.is_empty: 
-                    entry_road_polys.append(seg1.buffer(main_road_width/2, cap_style=1, join_style=1))
-                    entry_road_centerlines.append(seg1)
-                if not seg2.is_empty: 
-                    entry_road_polys.append(seg2.buffer(main_road_width/2, cap_style=1, join_style=1))
-                    entry_road_centerlines.append(seg2)
-            else:
-                for item in selected_lines:
-                    clipped = item["line"].intersection(effective_buildable)
-                    if not clipped.is_empty: 
-                        entry_road_polys.append(clipped.buffer(main_road_width/2, cap_style=1, join_style=1))
-                        entry_road_centerlines.append(clipped)
+                l1, l2 = selected_lines[0], selected_lines[1]
+                intersection = l1["line"].intersection(l2["line"])
+                if not intersection.is_empty and intersection.geom_type == 'Point':
+                    # CHANGE 1: Use site_boundary_full instead of effective_buildable
+                    seg1 = LineString([(l1["origin"].x, l1["origin"].y), (intersection.x, intersection.y)]).intersection(site_boundary_full)
+                    seg2 = LineString([(l2["origin"].x, l2["origin"].y), (intersection.x, intersection.y)]).intersection(site_boundary_full)
+                    
+                    if not seg1.is_empty: 
+                        base_poly = seg1.buffer(main_road_width/2, cap_style=1, join_style=1)
+                        splay_poly = create_entry_splay(seg1, l1["origin"], main_road_width)
+                        entry_road_polys.append(unary_union([base_poly, splay_poly]))
+                        entry_road_centerlines.append(seg1)
+                        
+                    if not seg2.is_empty: 
+                        base_poly = seg2.buffer(main_road_width/2, cap_style=1, join_style=1)
+                        splay_poly = create_entry_splay(seg2, l2["origin"], main_road_width)
+                        entry_road_polys.append(unary_union([base_poly, splay_poly]))
+                        entry_road_centerlines.append(seg2)
+                else:
+                    for item in selected_lines:
+                        # CHANGE 2: Use site_boundary_full
+                        clipped = item["line"].intersection(site_boundary_full)
+                        if not clipped.is_empty: 
+                            base_poly = clipped.buffer(main_road_width/2, cap_style=1, join_style=1)
+                            splay_poly = create_entry_splay(clipped, item["origin"], main_road_width)
+                            entry_road_polys.append(unary_union([base_poly, splay_poly]))
+                            entry_road_centerlines.append(clipped)
         else:
             for item in selected_lines:
-                clipped = item["line"].intersection(effective_buildable)
+                # CHANGE 3: Use site_boundary_full
+                clipped = item["line"].intersection(site_boundary_full)
                 if not clipped.is_empty: 
-                    entry_road_polys.append(clipped.buffer(main_road_width/2, cap_style=1, join_style=1))
+                    base_poly = clipped.buffer(main_road_width/2, cap_style=1, join_style=1)
+                    splay_poly = create_entry_splay(clipped, item["origin"], main_road_width)
+                    entry_road_polys.append(unary_union([base_poly, splay_poly]))
                     entry_road_centerlines.append(clipped)
 
     entry_main_roads = unary_union(entry_road_polys) if entry_road_polys else Polygon()
@@ -191,23 +211,26 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     final_j = transform(MultiPolygon([p.buffer(main_road_width*0.55) for p in junction_points])).buffer(0).intersection(effective_buildable)
     
     internal_main_roads = unary_union([final_h, final_j, entry_main_roads]).buffer(0)
+    road_network_for_parcels = unary_union([internal_main_roads, internal_local_roads]).intersection(effective_buildable).buffer(0)
+    road_network_for_export = unary_union([internal_main_roads, internal_local_roads]).intersection(site_boundary_full).buffer(0)
     full_road_network = unary_union([internal_main_roads, internal_local_roads]).intersection(effective_buildable).buffer(0)
     
-    remaining_land = effective_buildable.difference(full_road_network).buffer(0)
+    remaining_land = effective_buildable.difference(road_network_for_parcels).buffer(0)
     if remaining_land.is_empty: return []
 
     # --- OUTPUT ROAD FEATURES ---
-    internal_main_vis = internal_main_roads.intersection(effective_buildable).buffer(0)
-    if not internal_main_vis.is_empty:
-        m_geoms = internal_main_vis.geoms if internal_main_vis.geom_type == 'MultiPolygon' else [internal_main_vis]
+    export_main_vis = road_network_for_export.intersection(internal_main_roads).buffer(0)
+    
+    if not export_main_vis.is_empty:
+        m_geoms = export_main_vis.geoms if export_main_vis.geom_type == 'MultiPolygon' else [export_main_vis]
         for mg in m_geoms:
             if mg.area < 0.1: continue
             features.append({
                 "type": "Feature", "geometry": mg, "properties": {"type": "road", "road_type": "main", "area_sqm": round(mg.area, 2)}
             })
     
-    local_export = internal_local_roads.intersection(effective_buildable).buffer(0)
-    final_local_export = local_export.difference(internal_main_vis).buffer(0)
+    # Extract Local Roads (Difference between Full Network and Main Roads)
+    final_local_export = road_network_for_export.difference(internal_main_roads).buffer(0)
     if not final_local_export.is_empty:
         l_geoms = final_local_export.geoms if final_local_export.geom_type == 'MultiPolygon' else [final_local_export]
         for lg in l_geoms:
@@ -393,30 +416,19 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
 
 # ... (Previous code remains the same up to Section 5) ...
 
-    # --- 5. ASSIGN UTILITIES (WTP & PONDS) ---
-    # 5A. REAL ELEVATION ASSIGNMENT
-    # ------------------------------------------------------------
+    # ... (Keep code sections 1 through 4 as they are) ...
+
+    # --- 5. UTILITY & ELEVATION SETUP ---
+    # 5A. Assign Real Elevation
     if elevation_points:
         elev_tree, z_values = build_elevation_index(elevation_points)
-
         for p in final_parcels:
-            p["elevation_real"] = parcel_elevation(
-                p["world_geom"],
-                elev_tree,
-                z_values                                              
-            )
+            p["elevation_real"] = parcel_elevation(p["world_geom"], elev_tree, z_values)
     else:
-        # Absolute fallback (should never happen now)
-        for p in final_parcels:
-            p["elevation_real"] = 0.0
+        for p in final_parcels: p["elevation_real"] = 0.0
 
-
-    # 5B. Sort: Lowest Elevation First
-    final_parcels.sort(key=lambda x: x["elevation_real"])
-
-    # --- NEW: DEFINE EXCLUSION ZONE (Away from Main Roads) ---
-    # We want to avoid placing utilities right next to the main boulevard.
-    # Collect all main road geometries (Existing + Generated)
+    # 5B. Define Exclusion Zone (Main Road Buffers)
+    # We prefer utilities away from main boulevards
     main_road_geoms = []
     if not road_geom.is_empty: main_road_geoms.append(road_geom)
     if not entry_main_roads.is_empty: main_road_geoms.append(entry_main_roads)
@@ -424,200 +436,276 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     
     exclusion_zone = Polygon()
     if main_road_geoms:
-        # Buffer distance: How far away should utilities be? (e.g., 40 meters)
         utility_avoid_distance = constraints.get("utility_road_separation_m", 40.0)
-        all_main_roads = unary_union(main_road_geoms)
-        exclusion_zone = all_main_roads.buffer(utility_avoid_distance)
+        exclusion_zone = unary_union(main_road_geoms).buffer(utility_avoid_distance)
 
-    # Helper to check if a parcel is "too close" to main road
     def is_prime_area(parcel_geom):
-        if exclusion_zone.is_empty: return False
-        return parcel_geom.intersects(exclusion_zone)
+        """Returns True if parcel is too close to main roads."""
+        return not exclusion_zone.is_empty and parcel_geom.intersects(exclusion_zone)
 
-    # --- 5C. Targets ---
+    # 5C. Calculate Utility Targets
     total_generated_area = sum(p["world_geom"].area for p in final_parcels)
     target_wtp = total_generated_area * constraints.get("wtp_target_percent", 0.02)
     target_pond = total_generated_area * constraints.get("retention_pond_target_percent", 0.07)
 
-    # --- 6. SEED & GROW ALGORITHM FOR WTP (With Exclusion Logic) ---
-    wtp_indices = set()
-    current_wtp_area = 0
+    # ... (Keep code sections 1 through 5 as they are) ...
+
+    # ... (Keep code sections 1 through 5 as they are) ...
+
+    # ... (Keep code sections 1 through 5 as they are) ...
+
+    # --- 6. CLUSTER IDENTIFICATION & CLASSIFICATION ---
+    all_parcel_geoms = [p["world_geom"] for p in final_parcels]
+    if not all_parcel_geoms: return []
     
-    if final_parcels:
-        # 1. Find the Best Seed (Lowest Elevation AND Not in Prime Area)
-        seed_idx = -1
+    total_site_area = sum(g.area for g in all_parcel_geoms)
+    
+    # 1. Physical Clustering (Adjacency)
+    # Merge parcels that are touching to identify "islands" separated by roads
+    all_union = unary_union(all_parcel_geoms)
+    physical_islands = []
+    if all_union.geom_type == 'Polygon': physical_islands = [all_union]
+    elif all_union.geom_type == 'MultiPolygon': physical_islands = list(all_union.geoms)
+    
+    clusters = []
+    for island in physical_islands:
+        prep_island = prep(island.buffer(0.1))
+        indices = [i for i, p in enumerate(final_parcels) if prep_island.intersects(p["world_geom"].centroid)]
         
-        # Pass 1: Strict Check (Must be away from road)
-        for i, p in enumerate(final_parcels):
-            if not is_prime_area(p["world_geom"]):
-                seed_idx = i
-                break
-        
-        # Pass 2: Fallback (If site is small/narrow, pick lowest regardless)
-        if seed_idx == -1:
-            seed_idx = 0 
-        
-        wtp_indices.add(seed_idx)
-        current_wtp_area += final_parcels[seed_idx]["world_geom"].area
-        
-        # 2. Grow Contiguous Area
-        while current_wtp_area < target_wtp:
-            current_geoms = [final_parcels[i]["world_geom"] for i in wtp_indices]
-            current_union = unary_union(current_geoms)
-            best_candidate = -1
-            
-            # We prefer neighbors that are also NOT in prime area, but continuity is priority
-            candidates = []
-            for i, p in enumerate(final_parcels):
-                if i in wtp_indices: continue
-                # Check adjacency (buffer slight amount to ensure touch)
-                if p["world_geom"].buffer(0.5).intersects(current_union):
-                    candidates.append(i)
-            
-            if not candidates: break
+        if indices:
+            c_area = sum(final_parcels[i]["world_geom"].area for i in indices)
+            c_elev = sum(final_parcels[i]["elevation_real"] for i in indices) / len(indices)
+            clusters.append({
+                "indices": indices,
+                "area": c_area,
+                "avg_elev": c_elev,
+                "centroid": island.centroid
+            })
 
-            # Sort candidates: Prefer Non-Prime first, then by Elevation (original index)
-            # Since 'final_parcels' is already sorted by elevation, we just need to prioritize Non-Prime.
-            candidates.sort(key=lambda idx: (1 if is_prime_area(final_parcels[idx]["world_geom"]) else 0, idx))
+    # 2. Define Categories
+    wtp_target = total_site_area * constraints.get("wtp_target_percent", 0.02)
+    pond_target = total_site_area * constraints.get("retention_pond_target_percent", 0.07)
+    
+    # "Scrap": Truly tiny fragments (e.g. < 800sqm) that are likely useless for housing blocks
+    # "Fragment": Small isolated blocks (e.g. < 5% of site)
+    # "Main": The big chunks
+    scrap_threshold = 800.0 
+    fragment_threshold = total_site_area * 0.05
+    
+    scraps = [c for c in clusters if c["area"] < scrap_threshold]
+    fragments = [c for c in clusters if scrap_threshold <= c["area"] < fragment_threshold]
+    main_blocks = [c for c in clusters if c["area"] >= fragment_threshold]
+    
+    wtp_indices = set()
+    pond_indices = set()
+
+    # --- 7. ASSIGN WTP (Single Contiguous Cluster) ---
+    # Strategy: Find ONE suitable cluster (Fragment or part of Main)
+    
+    wtp_assigned = False
+    wtp_candidates = [c for c in clusters if c["area"] >= (wtp_target * 0.9)]
+    
+    if wtp_candidates:
+        # Prefer smallest valid candidate (to save big blocks) then lowest elevation
+        wtp_candidates.sort(key=lambda c: (c["area"], c["avg_elev"]))
+        best_cluster = wtp_candidates[0]
+        
+        # Seed from lowest elev inside this cluster
+        c_pool = set(best_cluster["indices"])
+        
+        # Score: Elev + Penalty for Prime Road
+        def get_score(idx):
+            p = final_parcels[idx]
+            return p["elevation_real"] + (1000.0 if is_prime_area(p["world_geom"]) else 0)
+
+        seed = min(c_pool, key=get_score)
+        
+        # Grow Contiguously
+        growing = {seed}
+        curr_area = final_parcels[seed]["world_geom"].area
+        
+        while curr_area < wtp_target:
+            curr_geom = unary_union([final_parcels[i]["world_geom"] for i in growing])
+            prep_geom = prep(curr_geom.buffer(1.0))
             
-            best_candidate = candidates[0]
-            wtp_indices.add(best_candidate)
-            current_wtp_area += final_parcels[best_candidate]["world_geom"].area
+            neighbors = [i for i in c_pool if i not in growing and prep_geom.intersects(final_parcels[i]["world_geom"])]
+            if not neighbors: break
+            
+            best_n = min(neighbors, key=get_score)
+            growing.add(best_n)
+            curr_area += final_parcels[best_n]["world_geom"].area
+            
+        wtp_indices = growing
+        wtp_assigned = True
 
-    # Generate WTP Feature
-    wtp_geoms_to_merge = []
-    for idx in wtp_indices:
-        p = final_parcels[idx]
-        p["props"]["label"] = "WTP" 
-        wtp_geoms_to_merge.append(p["world_geom"])
+    # --- 8. ASSIGN PONDS (Strict Sizing & Zoning) ---
+    
+    pond_indices = set()
+    park_indices = set()
+    pond_centers = [] 
+    
+    # User Constants
+    MIN_POND_SIZE = 3000.0  
+    MAX_POND_SIZE = 6000.0 
+    ELEVATION_WEIGHT = 5.0
+    
+    # 1. Scraps -> Green Buffers
+    for s in scraps:
+        valid_s = [i for i in s["indices"] if i not in wtp_indices]
+        park_indices.update(valid_s)
 
-    if wtp_geoms_to_merge:
-        wtp_union = unary_union(wtp_geoms_to_merge)
+    # 2. Build Candidate Pool
+    candidate_pool = set()
+    for f in fragments: candidate_pool.update(f["indices"])
+    for m in main_blocks: candidate_pool.update(m["indices"])
+    candidate_pool = {i for i in candidate_pool if i not in wtp_indices and i not in park_indices}
+    
+    current_pond_area = 0
+
+    while current_pond_area < pond_target and candidate_pool:
+        
+        # --- SEED SELECTION ---
+        seed = None
+        
+        if not pond_centers:
+            # First Pond: Lowest Point
+            seed = min(candidate_pool, key=lambda i: final_parcels[i]["elevation_real"])
+        else:
+            # Subsequent Ponds: Weighted Score (Distance vs Elevation)
+            def get_weighted_score(idx):
+                p_geom = final_parcels[idx]["world_geom"]
+                elev = final_parcels[idx]["elevation_real"]
+                
+                # Distance to nearest existing pond
+                dist_to_nearest = min(p_geom.centroid.distance(pc) for pc in pond_centers)
+                
+                # Score = Distance - (Elevation * Weight)
+                return dist_to_nearest - (elev * ELEVATION_WEIGHT)
+            
+            seed = max(candidate_pool, key=get_weighted_score)
+
+        # --- GROWTH LOGIC ---
+        remaining_need = pond_target - current_pond_area
+        this_pond_target = min(remaining_need, MAX_POND_SIZE)
+        if this_pond_target < MIN_POND_SIZE: this_pond_target = MIN_POND_SIZE
+
+        growing = {seed}
+        g_area = final_parcels[seed]["world_geom"].area
+        if seed in candidate_pool: candidate_pool.remove(seed)
+        
+        while g_area < this_pond_target and candidate_pool:
+            curr_geom = unary_union([final_parcels[i]["world_geom"] for i in growing])
+            prep_geom = prep(curr_geom.buffer(1.0))
+            
+            neighbors = [i for i in candidate_pool if prep_geom.intersects(final_parcels[i]["world_geom"])]
+            if not neighbors: break
+            
+            # Grow into LOWEST neighbor
+            best_n = min(neighbors, key=lambda i: final_parcels[i]["elevation_real"])
+            growing.add(best_n)
+            candidate_pool.remove(best_n)
+            g_area += final_parcels[best_n]["world_geom"].area
+            
+        # --- STRICT VALIDATION (The Fix) ---
+        # REMOVED the "* 0.8" tolerance. Ponds must strictly meet the size requirement.
+        if g_area >= MIN_POND_SIZE:
+            pond_indices.update(growing)
+            current_pond_area += g_area
+            
+            # Track location
+            new_pond_geom = unary_union([final_parcels[i]["world_geom"] for i in growing])
+            pond_centers.append(new_pond_geom.centroid)
+        else:
+            # It failed to reach 3000 sqm -> Force to Park (Green Buffer)
+            # This will turn those small bottom-corner blue squares into Green Parks.
+            park_indices.update(growing)
+
+    # --- 9. GENERATE FEATURES (WITH MERGING) ---
+    
+    # A. WTP (Merged)
+    if wtp_indices:
+        wtp_geom = unary_union([final_parcels[i]["world_geom"] for i in wtp_indices])
         features.append({
-            "type": "Feature",
-            "geometry": wtp_union,
+            "type": "Feature", "geometry": wtp_geom,
             "properties": {
-                "type": "green",
-                "subtype": "utility",
-                "label": "WTP",
-                "utility_type": "Water Treatment Plant",
-                "area_sqm": wtp_union.area
+                "type": "green", "subtype": "utility", "label": "WTP",
+                "utility_type": "Water Treatment Plant", "area_sqm": round(wtp_geom.area, 2)
             }
         })
 
-    # --- 7. ASSIGN PONDS (Distributed + Setbacks + Exclusion) ---
-    current_pond_area = 0
-    pond_setback = constraints.get("pond_setback_m", 10.0)
-    pond_indices = set()
+    # B. PONDS - THE FIX: UNIFY GEOMETRY BEFORE BUFFERING
+    # Instead of looping through individual parcels, we group them into connected components
+    # and treat each component as ONE single pond.
     
-    # Pass 1: Best Candidates (Lowest + Distributed + AWAY FROM ROAD)
-    for i, p in enumerate(final_parcels):
-        if i in wtp_indices: continue 
-        if current_pond_area >= target_pond: break
+    if pond_indices:
+        all_pond_geoms = [final_parcels[i]["world_geom"] for i in pond_indices]
+        # Union all pond parcels into a single MultiPolygon/Polygon
+        # This dissolves the internal lines between adjacent pond parcels
+        unified_pond_land = unary_union(all_pond_geoms)
         
-        # EXCLUSION CHECK: Skip if near main road
-        if is_prime_area(p["world_geom"]): continue
+        # Split back into distinct islands (in case we have 2-3 large separate lakes)
+        pond_islands = []
+        if unified_pond_land.geom_type == 'Polygon': pond_islands = [unified_pond_land]
+        elif unified_pond_land.geom_type == 'MultiPolygon': pond_islands = list(unified_pond_land.geoms)
         
-        # DISTRIBUTION CHECK: Skip if touching existing pond
-        is_touching_existing = False
-        current_poly = p["world_geom"]
-        for existing_idx in pond_indices:
-            existing_poly = final_parcels[existing_idx]["world_geom"]
-            if current_poly.distance(existing_poly) < 1.0:
-                is_touching_existing = True
-                break
+        pond_setback = constraints.get("pond_setback_m", 10.0)
         
-        if not is_touching_existing:
-            pond_indices.add(i)
-            current_pond_area += current_poly.area
-
-    # Pass 2: Fill Gaps (Relax Distribution, Keep Exclusion)
-    if current_pond_area < target_pond:
-        for i, p in enumerate(final_parcels):
-            if i in wtp_indices or i in pond_indices: continue
-            if current_pond_area >= target_pond: break
+        for i, island in enumerate(pond_islands):
+            # 1. Create the Water Surface (One big shape)
+            water_surface = island.buffer(-pond_setback)
             
-            if is_prime_area(p["world_geom"]): continue
-            
-            pond_indices.add(i)
-            current_pond_area += p["world_geom"].area
-
-    # Pass 3: Desperation (Relax Exclusion - if we still need area)
-    if current_pond_area < target_pond:
-        for i, p in enumerate(final_parcels):
-            if i in wtp_indices or i in pond_indices: continue
-            if current_pond_area >= target_pond: break
-            
-            # Now we accept parcels near main road if we have no choice
-            pond_indices.add(i)
-            current_pond_area += p["world_geom"].area
-
-    # Generate Pond Features (with Setbacks)
-# ---------------------------------------------------------
-    # MODIFIED: Generate Pond Features (Water + Green Bank)
-    # ---------------------------------------------------------
-    for i, p in enumerate(final_parcels):
-        if i in wtp_indices: continue 
-        
-        if i in pond_indices:
-            # 1. Calculate the Water Surface (Inner)
-            water_surface = p["world_geom"].buffer(-pond_setback)
+            # 2. Assign Properties (Use the first parcel's props as template)
+            # We can't easily link back to specific parcel props since we merged them,
+            # but for a pond, generic props are fine.
+            base_props = {
+                 "type": "green", 
+                 "subtype": "utility", 
+                 "label": "Retention Pond",
+                 "utility_type": "Retention Pond"
+            }
             
             if water_surface.is_empty:
-                # Fallback: Parcel too small for setback, make it all green park
-                p["props"].update({"type": "green", "label": "Green Space", "subtype": "park"})
+                # If setback kills it, it's a Park
+                base_props.update({"subtype": "park", "label": "Green Space"})
                 features.append({
-                    "type": "Feature", 
-                    "geometry": p["world_geom"], 
-                    "properties": p["props"]
+                    "type": "Feature", "geometry": island, 
+                    "properties": base_props
                 })
             else:
-                # 2. Calculate the Bank (Outer Ring)
-                # We take the full parcel and subtract the water surface
-                bank_geom = p["world_geom"].difference(water_surface)
-                
-                # 3. Add Water Feature (Blue)
-                # formatting props for the water
-                water_props = p["props"].copy()
-                water_props.update({
-                    "type": "green",
-                    "subtype": "utility",
-                    "label": "Retention Pond",     # 'Pond' triggers BLUE in export_dxf
-                    "utility_type": "Retention Pond",
-                    "water_area_sqm": round(water_surface.area, 2)
-                })
+                # Water
+                w_props = base_props.copy()
+                w_props["water_area_sqm"] = round(water_surface.area, 2)
                 features.append({
-                    "type": "Feature",
-                    "geometry": water_surface,
-                    "properties": water_props
+                    "type": "Feature", "geometry": water_surface, 
+                    "properties": w_props
                 })
-
-                # 4. Add Bank Feature (Green)
+                
+                # Bank (Ring around the water)
+                bank_geom = island.difference(water_surface)
                 if not bank_geom.is_empty:
-                    bank_props = p["props"].copy()
-                    bank_props.update({
-                        "type": "green",
-                        "subtype": "buffer",
-                        "label": "Utility Buffer", # AVOID using "Pond" here so it stays GREEN
+                    b_props = {
+                        "type": "green", 
+                        "subtype": "buffer", 
+                        "label": "Utility Buffer",
                         "utility_type": "Buffer",
                         "area_sqm": round(bank_geom.area, 2)
-                    })
+                    }
                     features.append({
-                        "type": "Feature",
-                        "geometry": bank_geom,
-                        "properties": bank_props
+                        "type": "Feature", "geometry": bank_geom, 
+                        "properties": b_props
                     })
-        else:
-            # Standard Parcels
-            features.append({
-                "type": "Feature", 
-                "geometry": p["world_geom"], 
-                "properties": p["props"]
-            })
 
-    # ... (Rest of cleanup logic Section 8) ...
+    # C. Standard Parcels (WITH LABELS)
+    parcel_counter = 1  # <--- NEW COUNTER
+    for i, p in enumerate(final_parcels):
+        if i not in wtp_indices and i not in pond_indices:
+            # Assign Label
+            p["props"]["label"] = f"P-{parcel_counter}"
+            parcel_counter += 1
+            
+            features.append({"type": "Feature", "geometry": p["world_geom"], "properties": p["props"]})
 
-    # --- 8. RESIDUAL GREEN (CLEANUP) ---
+    # --- 10. RESIDUAL GREEN ---
     if final_parcels:
         built_parcels = unary_union([p["world_geom"] for p in final_parcels])
         total_built = unary_union([built_parcels, full_road_network])
@@ -628,10 +716,10 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     if not final_green.is_empty:
         greens = list(final_green.geoms) if final_green.geom_type == "MultiPolygon" else [final_green]
         for g in greens:
-            # High threshold to avoid reporting tiny slivers as parks
             if g.area < 100.0: continue 
             features.append({
-                "type": "Feature", "geometry": g, "properties": {"type": "green", "label": "Park", "subtype": "park", "area_sqm": round(g.area, 2)}
+                "type": "Feature", "geometry": g, 
+                "properties": {"type": "green", "label": "Park", "subtype": "park", "area_sqm": round(g.area, 2)}
             })
 
     return features
