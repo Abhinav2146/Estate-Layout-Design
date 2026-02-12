@@ -98,10 +98,10 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     for line in abstract_lines_v:
         world_line = transform(line)
         if world_line.intersects(inset_site):
-            clipped_center = world_line.intersection(effective_buildable)
+            clipped_center = world_line.intersection(effective_buildable) 
             if not clipped_center.is_empty:
                 valid_vertical_centerlines.append(clipped_center)
-                final_v_polys.append(clipped_center.buffer(local_road_width/2, cap_style=1, join_style=1))
+                final_v_polys.append(clipped_center.buffer(local_road_width/2, cap_style=2, join_style=1))
     
     internal_local_roads = unary_union(final_v_polys).buffer(0)
     
@@ -205,7 +205,7 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
             
             trimmed_segment = LineString([sorted_points[0], sorted_points[-1]])
             if trimmed_segment.intersects(effective_buildable):
-                horizontal_road_polys.append(trimmed_segment.buffer(main_road_width/2, cap_style=1, join_style=1))
+                horizontal_road_polys.append(trimmed_segment.buffer(main_road_width/2, cap_style=2, join_style=1))
 
     final_h = unary_union(horizontal_road_polys).buffer(0) if horizontal_road_polys else Polygon()
     final_j = transform(MultiPolygon([p.buffer(main_road_width*0.55) for p in junction_points])).buffer(0).intersection(effective_buildable)
@@ -263,7 +263,7 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
         prep_block = prep(block)
         
         curr_y = lbminy
-        min_dim_threshold = 5.0 # Minimum dimension to be considered "usable" on its own
+        min_dim_threshold = 30.0 # Minimum dimension to be considered "usable" on its own
 
         while curr_y < lbmaxy:
             # 1. Select Program
@@ -526,7 +526,7 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
         
         while curr_area < wtp_target:
             curr_geom = unary_union([final_parcels[i]["world_geom"] for i in growing])
-            prep_geom = prep(curr_geom.buffer(1.0))
+            prep_geom = prep(curr_geom.buffer(5.0))
             
             neighbors = [i for i in c_pool if i not in growing and prep_geom.intersects(final_parcels[i]["world_geom"])]
             if not neighbors: break
@@ -661,7 +661,8 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
                  "type": "green", 
                  "subtype": "utility", 
                  "label": "Retention Pond",
-                 "utility_type": "Retention Pond"
+                 "utility_type": "Retention Pond",
+                 "area_sqm": round(water_surface.area, 2)
             }
             
             if water_surface.is_empty:
@@ -686,9 +687,9 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
                     b_props = {
                         "type": "green", 
                         "subtype": "buffer", 
-                        "label": "Utility Buffer",
-                        "utility_type": "Buffer",
-                        "area_sqm": round(bank_geom.area, 2)
+                        "label": "",
+                        "utility_type": "",
+                        # "area_sqm": round(bank_geom.area, 2)
                     }
                     features.append({
                         "type": "Feature", "geometry": bank_geom, 
@@ -716,7 +717,7 @@ def generate_parcels(project_id, data_dir, config_dir, buildable_geom, road_geom
     if not final_green.is_empty:
         greens = list(final_green.geoms) if final_green.geom_type == "MultiPolygon" else [final_green]
         for g in greens:
-            if g.area < 100.0: continue 
+            if g.area < 500.0: continue 
             features.append({
                 "type": "Feature", "geometry": g, 
                 "properties": {"type": "green", "label": "Park", "subtype": "park", "area_sqm": round(g.area, 2)}

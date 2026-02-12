@@ -2,6 +2,7 @@ import ezdxf
 import os
 import traceback
 import json
+import math
 from ezdxf.enums import TextEntityAlignment
 
 # RGB Color Mapping for AutoCAD - UPDATED FOR HIGH CONTRAST
@@ -26,10 +27,10 @@ COLOR_MAP = {
 }
 
 # --- CONFIGURABLE FONT SIZES ---
-TEXT_H_PARCEL = 12.0   # Increased from 2.5
-TEXT_H_UTILITY = 12.0  # Increased from 3.5
-TEXT_H_TABLE_HEAD = 24.0
-TEXT_H_TABLE_BODY = 18
+TEXT_H_PARCEL = 8.0   
+TEXT_H_UTILITY = 8.0  
+TEXT_H_TABLE_HEAD = 16.0
+TEXT_H_TABLE_BODY = 12
 
 def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_features, metrics=None, filename=None):
     try:
@@ -41,6 +42,16 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
         doc = ezdxf.new("R2010") 
         msp = doc.modelspace()
 
+        # INSERT THIS STYLE SETUP (Makes arrows visible) ---
+        # Create a specific style for leaders with large arrows
+        dim_style_name = "PARCEL_LEADER_STYLE"
+        if dim_style_name not in doc.dimstyles:
+            style = doc.dimstyles.new(dim_style_name)
+            style.dxf.dimasz = 4.0      # Arrow Size (Increased for visibility)
+            style.dxf.dimldrblk = ""    # Default closed filled arrow
+            style.dxf.dimclrd = 256     # Leader line color (ByLayer)
+            style.dxf.dimtxsty = "Standard"
+
         # Create Layers
         for layer_name in COLOR_MAP.keys():
             if layer_name not in doc.layers:
@@ -50,7 +61,6 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
         def draw_solid_hatch(geom, layer_name):
             if geom is None or geom.is_empty: return
             
-            # Simplify slightly to prevent hatch failure
             clean_geom = geom.simplify(0.01, preserve_topology=True)
 
             if clean_geom.geom_type == 'Polygon':
@@ -95,6 +105,127 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 for poly in geom.geoms:
                     draw_polygon_with_border(poly, fill_layer, border_color, line_width)
 
+        site_center_point = None
+        if "raw_geom" in buildable_data and buildable_data["raw_geom"]:
+            site_center_point = buildable_data["raw_geom"].centroid
+        # --- SMART LABEL HELPER (Auto-Wrap & Fit) ---
+        def add_smart_label(msp, text, geom, layer, text_height, site_center=None):
+            if not text or not geom or geom.is_empty: return
+            
+            target_geom = geom
+            if geom.geom_type == 'MultiPolygon':
+                target_geom = max(geom.geoms, key=lambda g: g.area)
+
+            try:
+                # 1. Geometry Analysis
+                rect = target_geom.minimum_rotated_rectangle
+                coords = list(rect.exterior.coords)
+                edge_len_1 = math.hypot(coords[1][0]-coords[0][0], coords[1][1]-coords[0][1])
+                edge_len_2 = math.hypot(coords[2][0]-coords[1][0], coords[2][1]-coords[1][1])
+                
+                if edge_len_1 > edge_len_2:
+                    longest_len, short_len = edge_len_1, edge_len_2
+                    dx, dy = coords[1][0]-coords[0][0], coords[1][1]-coords[0][1]
+                else:
+                    longest_len, short_len = edge_len_2, edge_len_1
+                    dx, dy = coords[2][0]-coords[1][0], coords[2][1]-coords[1][1]
+                
+                angle_deg = math.degrees(math.atan2(dy, dx))
+                while angle_deg <= -90: angle_deg += 180
+                while angle_deg > 90: angle_deg -= 180
+
+                # --- NEW CHECKS ---
+                plot_area = target_geom.area
+                is_tiny = plot_area < 450.0 
+                
+                # NARROW CHECK: If width is less than ~2x text height, it's too thin for 2 lines
+                # Assuming text_height is ~8.0, we need at least 16-18m width to fit comfortably
+                is_narrow = short_len < (text_height * 2.2)
+
+                # Dynamic Settings
+                effective_h = text_height * 0.7 if (is_tiny or is_narrow) else text_height
+                
+                # 2. FIT CHECK
+                lines = text.split('\\P')
+                max_chars = max([len(line) for line in lines]) if lines else 0
+                
+                est_text_width = max_chars * effective_h * 0.65 
+                est_text_height = len(lines) * effective_h * 1.25
+                
+                # STRICTER WIDTH CHECK: Only use 80% of width (was 95%) to prevent border touching
+                fits_dimensions = (est_text_width <= longest_len * 0.95) and (est_text_height <= short_len * 0.80)
+                
+                text_area = est_text_width * est_text_height
+                area_ratio = text_area / (plot_area + 1e-9)
+                aspect_ratio = longest_len / (short_len + 1e-9)
+                
+                max_fill = 0.90 if is_tiny else 0.80
+                
+                # FORCE LEADER if it's too narrow, even if the area is big enough
+                should_be_inside = fits_dimensions and (area_ratio < max_fill) and not is_narrow
+
+                visual_center = target_geom.representative_point()
+
+                if should_be_inside:
+                    # --- PLACEMENT: INSIDE ---
+                    
+                    mtext = msp.add_mtext(str(text), dxfattribs={
+                        'layer': layer,
+                        'char_height': effective_h, 
+                        'color': 7 
+                    })
+                    mtext.dxf.width = longest_len 
+                    mtext.dxf.rotation = angle_deg
+                    mtext.dxf.attachment_point = 5 
+                    mtext.dxf.insert = (visual_center.x, visual_center.y)
+                    if layer in COLOR_MAP:
+                        mtext.dxf.true_color = ezdxf.colors.rgb2int(COLOR_MAP[layer])
+
+                else:
+                    # --- PLACEMENT: LEADER ---
+                    dir_x, dir_y = 1.0, 1.0 
+                    if site_center:
+                        dx_c = visual_center.x - site_center.x
+                        dy_c = visual_center.y - site_center.y
+                        dist = math.hypot(dx_c, dy_c)
+                        if dist > 0: dir_x, dir_y = dx_c/dist, dy_c/dist
+                    
+                    # Offset Logic
+                    buffer_dist = 2.0 if (is_tiny or is_narrow) else 12.0
+                    offset_dist = (short_len / 2.0) + buffer_dist
+                    
+                    p_target = (visual_center.x, visual_center.y)
+                    p_text = (visual_center.x + dir_x * offset_dist, visual_center.y + dir_y * offset_dist)
+                    
+                    leader = msp.add_leader(
+                        vertices=[p_text, p_target], 
+                        dxfattribs={
+                            'layer': layer, 
+                            'dimstyle': 'PARCEL_LEADER_STYLE'
+                        }
+                    )
+                    
+                    if layer in COLOR_MAP: 
+                        leader.dxf.true_color = ezdxf.colors.rgb2int(COLOR_MAP[layer])
+
+                    mtext = msp.add_mtext(str(text), dxfattribs={
+                        'layer': layer,
+                        'char_height': effective_h, 
+                        'color': 7
+                    })
+                    
+                    mtext.dxf.attachment_point = 4 if dir_x >= 0 else 6
+                    mtext.dxf.insert = p_text      
+                    if layer in COLOR_MAP: 
+                        mtext.dxf.true_color = ezdxf.colors.rgb2int(COLOR_MAP[layer])
+
+            except Exception as e:
+                try:
+                    p = target_geom.representative_point()
+                    msp.add_text(str(text), dxfattribs={'layer': layer, 'height': text_height})\
+                       .set_placement((p.x, p.y), align=TextEntityAlignment.MIDDLE_CENTER)
+                except: pass
+
         # --- DRAW GEOMETRY ---
         
         # 1. Green Belt
@@ -121,12 +252,15 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 
                 draw_polygon_with_border(geom, layer, border_color=(50, 50, 50), line_width=0.5)
                 
-                # Label Parcel (INCREASED FONT SIZE)
+                # Label with Area
                 label_txt = props.get("label")
+                area_val = props.get("area_sqm")
+                
                 if label_txt:
-                    center = geom.centroid
-                    msp.add_text(str(label_txt), dxfattribs={'layer': 'TEXT_LABELS', 'height': TEXT_H_PARCEL})\
-                       .set_placement((center.x, center.y), align=TextEntityAlignment.MIDDLE_CENTER)
+                    final_label = label_txt
+                    if area_val:
+                        final_label += f"\\P{int(area_val)} sqm"
+                    add_smart_label(msp, final_label, geom, 'TEXT_LABELS', TEXT_H_PARCEL, site_center=site_center_point)
 
             # --- ROADS ---
             elif f_type == "road":
@@ -135,10 +269,12 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 l_width = 0.5 if road_type == "main" else 0.4
                 draw_polygon_with_border(geom, layer, line_width=l_width)
 
-            # --- UTILITIES & GREEN AREAS ---
+            # --- UTILITIES & GREEN AREAS (UPDATED) ---
             elif f_type == "green":
                 label = props.get("label", "")
                 utility = props.get("utility_type", "")
+                area_val = props.get("area_sqm")
+                subtype = props.get("subtype", "") # Get subtype
                 
                 # Determine Layer
                 if "WTP" in label or "Water Treatment" in utility:
@@ -151,22 +287,24 @@ def geometry_to_dxf(project_id, data_dir, buildable_data, road_data, parcel_feat
                 draw_polygon_with_border(geom, target_layer, border_color=(50, 100, 50), line_width=0.5)
 
                 # --- LABELING LOGIC ---
-                # Only label WTP or POND. Skip generic GREEN_AREA.
-                if target_layer in ["UTILITY_WTP", "UTILITY_POND"]:
-                    
-                    display_label = label if label else utility
-                    
-                    # Hardcode fallback if name is missing but type is known
-                    if target_layer == "UTILITY_WTP" and not display_label:
-                        display_label = "WTP"
-                    elif target_layer == "UTILITY_POND" and not display_label:
-                        display_label = "Pond"
+                # Determine the base text
+                display_label = label if label else utility
+                
+                # Defaults if empty, BUT SKIP if it is a buffer (we just want area)
+                if not display_label and subtype != "buffer":
+                    if target_layer == "UTILITY_WTP": display_label = "WTP"
+                    elif target_layer == "UTILITY_POND": display_label = "Pond"
+                    elif target_layer == "GREEN_AREA": display_label = "Green"
 
+                # Append Area (Handle formatting carefully)
+                if area_val:
                     if display_label:
-                        center = geom.centroid
-                        # Use LARGER FONT for Utilities
-                        msp.add_text(str(display_label), dxfattribs={'layer': 'TEXT_LABELS', 'height': TEXT_H_UTILITY})\
-                           .set_placement((center.x, center.y), align=TextEntityAlignment.MIDDLE_CENTER)
+                        display_label += f"\\P{int(area_val)}\u00A0sqm"
+                    else:
+                        display_label = f"{int(area_val)}\u00A0sqm"
+
+                # Add the label
+                add_smart_label(msp, display_label, geom, 'TEXT_LABELS', TEXT_H_UTILITY, site_center=site_center_point)
 
 
         # --- DRAW TABLES ---
